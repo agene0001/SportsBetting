@@ -1,0 +1,13 @@
+[project]
+name = "sportsbetting"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "playwright>=1.52.0",
+    "psycopg2>=2.9.10",
+    "rich>=14.0.0",
+    "selenium>=4.33.0",
+]
