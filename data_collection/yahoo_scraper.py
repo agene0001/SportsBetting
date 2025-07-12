@@ -1,462 +1,255 @@
-# data_collection/yahoo_scraper.py
-import time
-import json
 import re
-from playwright.sync_api import Error as PlaywrightError
+import time
+import traceback
+from playwright.sync_api import Error as PlaywrightError, Page, BrowserContext, sync_playwright, expect
+
+# --- NEW IMPORTS ---
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # Import the new strategies
-from .scraping_strategies import NFLStrategy, NHLStrategy, NBAStrategy
+from .scraping_strategies import NFLStrategy, NHLStrategy, NBAStrategy, MLBStrategy
+
+# You can adjust this, but 2 is a safe starting point to avoid getting blocked.
+game_threads = 2
 
 class YAHOOScraper:
-    def __init__(self, sport_name, page, db_manager):
-        self.page = page
+    def __init__(self, sport_name, db_manager):
+        """
+        Initializes the scraper with a specific sport, database manager,
+        and a shared shutdown event for graceful termination.
+        """
         self.db = db_manager
         self.sport_name = sport_name
         self.sport_id = None
         self.YAHOO_BASE_URL = "https://sports.yahoo.com"
-        self.scraped_games = set()
 
-        # FACTORY: Select the correct strategy based on the sport name
+        # --- THREAD-SAFE GAME TRACKING ---
+        self.scraped_games = set()
+        self.scraped_games_lock = threading.Lock()
+
+        # FACTORY: Select the correct strategy based on sport name
         if sport_name == 'nfl':
             self.strategy = NFLStrategy()
         elif sport_name == 'nhl':
             self.strategy = NHLStrategy()
         elif sport_name == 'nba':
             self.strategy = NBAStrategy()
+        elif sport_name == 'mlb':
+            self.strategy = MLBStrategy()
         else:
             raise ValueError(f"Unsupported sport: '{sport_name}'. No strategy available.")
 
-        # Delegate map creation to the strategy
         self.display_to_full_name_map, self.full_name_to_slug_map = self.strategy.get_display_to_full_name_map()
 
     def discover_teams(self):
-        # This method no longer needs sport_name, as it's part of the instance
+        """
+        Connects to Yahoo, discovers all teams for the sport, and returns their data.
+        This method is self-contained and manages its own browser lifecycle.
+        """
         print(f"  Discovering teams and building URL slug map from {self.YAHOO_BASE_URL}/{self.sport_name}/teams/")
         teams_data = {}
-        try:
-            self.page.goto(f"{self.YAHOO_BASE_URL}/{self.sport_name}/teams/", wait_until="domcontentloaded", timeout=60000)
-            team_info_containers = self.page.locator("div#team-info").all()
-            print(f"    - Found {len(team_info_containers)} team containers to process.")
-            for container in team_info_containers:
-                link_element = container.locator("a._ys_lbjwi2")
-                href = link_element.get_attribute('href')
-                display_name = link_element.text_content().strip()
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(bypass_csp=True,user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',locale='en-US', timezone_id='America/New_York')
+            try:
+                page.goto(f"{self.YAHOO_BASE_URL}/{self.sport_name}/teams/", wait_until="load", timeout=60000)
+                team_info_containers = page.locator("div#team-info").all()
+                print(f"    - Found {len(team_info_containers)} team containers to process.")
 
-                full_name = self.display_to_full_name_map.get(display_name)
-                if not full_name:
-                    print(f"    - Could not map display name '{display_name}' to a full team name. Skipping.")
-                    continue
+                for container in team_info_containers:
+                    link_element = container.locator("a._ys_lbjwi2")
+                    href = link_element.get_attribute('href')
+                    display_name = link_element.text_content().strip()
 
-                slug = self.full_name_to_slug_map.get(full_name)
-                if not all([href, slug]):
-                    print(f"    - Incomplete data for display name '{display_name}'. Skipping.")
-                    continue
+                    full_name = self.display_to_full_name_map.get(display_name)
+                    if not full_name: continue
 
-                teams_data[full_name] = {'url': href, 'slug': slug}
-            return teams_data
-        except PlaywrightError as e:
-            print(f"  - Could not load the Yahoo teams page: {e}")
-            return None
-    # --- REVISED GENERIC PARSER (AGAIN) ---
-    def _parse_stats_table(self, stat_block_locator):
-        """
-        Parses a standard Yahoo stats block. It's now more flexible.
-        """
-        try:
-            # The category name is always in an H3 within the block
-            category_name = stat_block_locator.locator("h3").text_content(timeout=5000).strip()
+                    slug = self.full_name_to_slug_map.get(full_name)
+                    if not all([href, slug]): continue
 
-            # This method will now parse ALL tables within the block and return
-            # a list of parsed table data.
-            all_tables_data = []
+                    teams_data[full_name] = {'url': href, 'slug': slug}
+                return teams_data
+            except PlaywrightError as e:
+                print(f"  - CRITICAL FAILURE during team discovery: {e}")
+                return None
+            finally:
+                print("  Team discovery browser closed.")
 
-            tables_in_block = stat_block_locator.locator("table").all()
-
-            for table_locator in tables_in_block:
-                header_cells = table_locator.locator('thead th').all()
-                if not header_cells: continue
-
-                header_full_names, header_abbreviations = [], []
-                for th in header_cells[1:]:
-                    title_div = th.locator('div[title]')
-                    full_name = title_div.get_attribute('title') if title_div.count() > 0 else th.text_content().strip()
-                    abbreviation = th.text_content().strip()
-                    header_full_names.append(full_name or abbreviation)
-                    header_abbreviations.append(abbreviation)
-                headers = {'names': header_full_names, 'abbreviations': header_abbreviations}
-
-                player_data = []
-                player_rows = table_locator.locator('tbody tr').all()
-                for row in player_rows:
-                    player_name_th = row.locator('th a')
-                    player_name_td = row.locator('td:first-child a')
-                    is_in_th = player_name_th.count() > 0
-                    is_in_td = player_name_td.count() > 0
-
-                    if is_in_th: player_link = player_name_th
-                    elif is_in_td: player_link = player_name_td
-                    else: continue
-
-                    player_name = player_link.text_content().strip()
-                    if "TOTAL" in player_name.upper(): continue
-
-                    player_url = player_link.get_attribute('href')
-                    yahoo_id_match = re.search(r'(\d+)$', player_url)
-                    if not yahoo_id_match: continue
-                    yahoo_id = yahoo_id_match.group(1)
-
-                    cols = row.locator('td').all()
-                    start_index = 1 if is_in_td else 0
-                    stat_values = [col.text_content().strip() for col in cols[start_index:]]
-                    player_data.append({'name': player_name, 'id': yahoo_id, 'stats': stat_values})
-
-                # Add the parsed data for this specific table to our list
-                all_tables_data.append({'headers': headers, 'players': player_data})
-
-            return category_name, all_tables_data
-        except PlaywrightError as e:
-            print(f"        - Error in generic table parser: {e}")
-            return None, None
     def process_one_team(self, full_name, team_info, start_year, end_year):
         """
-        :param full_name:
-        :param team_info:
-        :param start_year:
-        :param end_year:
-        :return:
+        Worker function to process all seasons for a single team. This is called
+        by the ThreadPoolExecutor and creates its own browser to ensure thread safety.
         """
-        if not self.sport_id:
-            sport_info = self.db.execute_query("SELECT sport_id FROM sports WHERE name = %s", (self.sport_name.upper(),), fetch='one')
-            self.sport_id = sport_info[0]
-
-        team_db_id = self.db.get_or_create_team(self.sport_id, full_name, team_info['slug'])
-        if not team_db_id: return
-
-        for year in range(end_year, start_year - 1, -1):
-            # Renamed from _scrape_yahoo_nfl_team_for_year
-            self._scrape_team_for_year(year, team_db_id, full_name, team_info)
-
-
-    # <select class="_ys_7jlmej _ys_pfo100 _ys_1xjsazm"><option value="2025" selected="">2025</option><option value="2024">2024</option><option value="2023">2023</option><option value="2022">2022</option><option value="2021">2021</option><option value="2020">2020</option><option value="2019">2019</option><option value="2018">2018</option><option value="2017">2017</option><option value="2016">2016</option><option value="2015">2015</option><option value="2014">2014</option><option value="2013">2013</option></select>
-    def _scrape_team_for_year(self, year, team_db_id, team_name, team_info):
-        print(f"    - Scraping data for {team_name} for season: {year}")
-
-        stats_url = f"https://sports.yahoo.com{team_info['url']}stats/"
-        self.page.goto(stats_url, wait_until="domcontentloaded", timeout=60000)
-        try:
-            season_selected = False
-            target_year = str(year)
-
-            # Let's first check if the correct year is already selected to avoid unnecessary actions
-            # This is a good practice for efficiency.
-            try:
-                current_selection = self.page.locator('select[data-tst="season-dropdown"] option[selected]').get_attribute('value')
-                if current_selection == target_year:
-                    print(f"      - Season {year} is already selected. No action needed.")
-                    season_selected = True
-            except PlaywrightError:
-                # If we can't find it, that's fine, we'll try to select it anyway.
-                pass
-
-
-            if not season_selected:
-                # --- NEW LOGIC TO TRY MULTIPLE SELECTORS AND WAIT CORRECTLY ---
-                print(f"      - Attempting to select season {year}...")
+        max_retries = 2
+        for attempt in range(max_retries):
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page(bypass_csp=True,user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',locale='en-US', timezone_id='America/New_York')
                 try:
-                    # Use a single block to attempt selection and then wait.
-                    primary_selector = 'select[data-tst="season-dropdown"]'
-                    alternate_selector = 'select._ys_7jlmej'
+                    print(f"\n{'='*25}\nProcessing Team: {full_name} (Thread: {threading.get_ident()}, Attempt: {attempt + 1})\n{'='*25}")
 
-                    # Use a Promise-based approach to handle the selection action
-                    # This ensures we are ready to listen for the network events right after the action.
-                    with self.page.expect_response(lambda response: "sports.yahoo.com" in response.url, timeout=20000) as response_info:
-                        # Try the primary selector first
+                    if not self.sport_id:
+                        sport_info = self.db.execute_query("SELECT sport_id FROM sports WHERE name = %s", (self.sport_name.upper(),), fetch='one')
+                        if sport_info: self.sport_id = sport_info[0]
+
+                    team_db_id = self.db.get_or_create_team(self.sport_id, full_name, team_info['slug'])
+                    if not team_db_id: return
+
+                    for year in range(end_year, start_year - 1, -1):
+                        base_schedule_url = f"https://sports.yahoo.com{team_info['url']}schedule/"
+                        if "?" in base_schedule_url:
+                            schedule_url = f"{base_schedule_url}&scheduleType=list&season={year}"
+                        else:
+                            schedule_url = f"{base_schedule_url}?scheduleType=list&season={year}"
+
+                        print(f"      - [{full_name}] Navigating to schedule for season {year}: {schedule_url}")
+                        page.goto(schedule_url, wait_until="domcontentloaded", timeout=60000)
+
+                        print(f"      - [{full_name}] Waiting for schedule content to load for {year}...")
+
+                        primary_schedule_container_selector = "div[data-testid='sched-filter-results']" # Preferred, modern table view
+                        secondary_schedule_container_selector = "div#schedule-list" # Fallback, list view
+
+                        parsing_mode = None
                         try:
-                            self.page.select_option(primary_selector, value=target_year, timeout=5000)
-                            print(f"      - Selected season {year} (using primary selector).")
+                            print(f"        Trying primary selector: {primary_schedule_container_selector}")
+                            page.wait_for_selector(primary_schedule_container_selector, timeout=15000) # Shorter timeout for the first try
+                            print(f"        Primary schedule container found ('{primary_schedule_container_selector}').")
+                            parsing_mode = 'table_view'
                         except PlaywrightError:
-                            print("        - Primary season dropdown selector not found. Trying alternate...")
-                            # If primary fails, try the alternate
-                            self.page.select_option(alternate_selector, value=target_year, timeout=5000)
-                            print(f"      - Selected season {year} (using alternate selector).")
+                            print(f"        Primary selector timed out. Trying secondary selector: {secondary_schedule_container_selector}")
+                            try:
+                                page.wait_for_selector(secondary_schedule_container_selector, timeout=15000)
+                                print(f"        Secondary schedule container found ('{secondary_schedule_container_selector}').")
+                                parsing_mode = 'list_view'
+                            except PlaywrightError:
+                                print(f"        Both primary and secondary schedule selectors failed for {full_name} - {year}.")
+                                page.screenshot(path=f"debug_schedule_load_failure_{full_name}_{year}.png")
+                                print(f"        Screenshot saved to debug_schedule_load_failure_{full_name}_{year}.png")
+                                continue # Skip to next year or team
 
-                    # The `with` block automatically waits for a response.
-                    # Now, we add an extra wait for the DOM to be re-rendered.
-                    self.page.wait_for_load_state('networkidle', timeout=15000)
-                    print(f"      - Network is idle. DOM should be updated for {year}.")
-
-                    season_selected = True
-
-                except PlaywrightError as e:
-                    print(f"      - Could not find or select year {year} on stats page. Skipping. Error: {e}")
-                except Exception as e:
-                    # The expect_response might time out, which is a different exception.
-                    print(f"      - Timed out waiting for a network response after selecting {year}. The page may not have updated. Error: {e}")
-
-
-            # If a season was successfully selected (or was already selected), parse the stats
-            if season_selected:
-                # --- DEBUGGING STEP (Optional but Recommended) ---
-                # You can uncomment this during testing to visually confirm the page has changed.
-                # self.page.screenshot(path=f'debug_screenshot_{year}.png')
-
-                self.page.wait_for_selector('div.ys-stats-table-wrapper', timeout=10000) # Wait for the table wrapper to be present
-                self._parse_yahoo_team_season_stats(year, team_db_id)
-
-        except Exception as e:
-            # A general catch-all for any other unexpected errors during this process
-            print(f"      - An unexpected error occurred during season stats processing for {year}: {e}")
-        finally:
-            try:
-                schedule_url = f"https://sports.yahoo.com{team_info['url']}schedule/?scheduleType=list&season={year}"
-                print(f"      - Navigating directly to schedule list view: {schedule_url}")
-                self.page.goto(schedule_url, wait_until="domcontentloaded", timeout=60000)
-                print(f"      - On schedule page for season {year}.")
-                self.page.wait_for_timeout(2000)
-
-                box_score_games = self._parse_yahoo_schedule_for_box_scores()
-                if not box_score_games:
-                    print(f"        - No completed games found for {year}.")
-                    return # Use return here to stop processing for this year if no games are found
-
-                print(f"        - Found {len(box_score_games)} completed games.")
-                for game in box_score_games:
-                    if game['game_id'] in self.scraped_games:
-                        print(f"        - Skipping already parsed game vs {game['opponent_display_name']} (ID: {game['game_id']})")
-                        continue
-
-                    opponent_full_name = self.display_to_full_name_map.get(game['opponent_display_name'])
-                    if not opponent_full_name:
-                        print(f"        - Could not map opponent display name '{game['opponent_display_name']}'. Skipping game.")
-                        continue
-
-                    # This line caused the error in a previous attempt and needs to be correct.
-                    # It relies on the full_name_to_slug_map being available from your strategy.
-                    opponent_slug = self.full_name_to_slug_map.get(opponent_full_name)
-                    if not opponent_slug:
-                        print(f"        - Could not map opponent '{opponent_full_name}' to a slug. Skipping.")
-                        continue
-
-                    opponent_team_id = self.db.get_or_create_team(self.sport_id, opponent_full_name, opponent_slug)
-                    print(f"        -> Scraping Box Score vs {opponent_full_name}")
-
-                    # --- *** THIS IS THE ONLY CHANGE TO YOUR ORIGINAL LOGIC *** ---
-                    # Call the correct parser based on the sport.
-                    if self.sport_name == 'nba':
-                        # Call the new, specialized parser for NBA pages
-                        self._parse_nba_box_score(game['url'], year, team_db_id, opponent_team_id, team_name, opponent_full_name)
-                    else:
-                        # Call your original, default parser for NFL, NHL, and MLB
-                        self._parse_yahoo_box_score(game['url'], year, team_db_id, opponent_team_id, team_name, opponent_full_name)
-                    # --- END OF CHANGE ---
-
-                    self.scraped_games.add(game['game_id'])
-                    time.sleep(2) # Politeness delay
-
-            except PlaywrightError as e:
-                print(f"      - An error occurred during schedule processing. Skipping game stats for {year}. Error: {e}")
-    def _parse_yahoo_team_season_stats(self, year, team_id):
-        print("        - Parsing season-level player stats...")
-        try:
-            stat_wrappers = self.page.locator('div.ys-stats-table-wrapper').all()
-
-            if not stat_wrappers:
-                print("        - New layout not found, checking for old layout...")
-                stat_wrappers = self.page.locator('#team-stats-player-tables section > div > div > table').all()
-
-                # If after checking both, we still have nothing, then exit.
-            if not stat_wrappers:
-                print("        - No season stat wrappers found on page for either layout.")
-                time.sleep(1000)
-                return
-
-
-            saved_categories = 0
-            for wrapper in stat_wrappers:
-                category, tables_data = self._parse_stats_table(wrapper)
-
-                # Season stats pages only have one table per wrapper
-                if not all([category, tables_data]) or not tables_data[0]['players']:
-                    print(f"        - Skipping stat block '{category or 'Unknown'}' due to no player data.")
-                    continue
-
-                table_info = tables_data[0]
-                headers = table_info['headers']
-                players = table_info['players']
-
-                stat_def_id = self.db.get_or_create_stat_definition(
-                    self.sport_id, category, headers['names'], headers['abbreviations']
-                )
-                if not stat_def_id: continue
-
-                for player in players:
-                    player_db_id = self.db.get_or_create_player(self.sport_id, player['name'], player['id'])
-                    if not player_db_id: continue
-
-                    self.db.insert_player_season_stats(
-                        player_id=player_db_id, team_id=team_id, season=year,
-                        stat_def_id=stat_def_id, stat_values=player['stats']
-                    )
-                saved_categories += 1
-
-            if saved_categories > 0:
-                print(f"        - Successfully parsed and saved season stats for {saved_categories} categories.")
-        except PlaywrightError as e:
-            print(f"        - An error occurred while processing season stats: {e}")
-    def _parse_yahoo_schedule_for_box_scores(self):
-        games = []
-        try:
-            rows = self.page.locator("table.latest-results-table tbody tr").all()
-            for row in rows:
-                row_text = row.text_content()
-                if "Bye Week" in row_text or "(Preseason)" in row_text: continue
-
-                box_score_link_element = row.locator('td:first-child a')
-                if box_score_link_element.count() == 0: continue
-
-                # --- FIXED ---
-                # Use a more specific selector to avoid grabbing extra "series score" spans in playoffs.
-                opponent_name_element = row.locator('td:nth-child(3) > span > span:first-child')
-                if opponent_name_element.count() == 0: continue # Skip if element not found
-
-                href = box_score_link_element.get_attribute('href')
-                game_id_match = re.search(r'-(\d{10,})/?$', href)
-
-                if game_id_match:
-                    game_id = game_id_match.group(1)
-                    # The new selector is more precise, so the complex regex is less critical,
-                    # but it's good to keep for cleaning up any remaining score text.
-                    opponent_display_name = re.sub(r'\s*\d+-\d+(-\d+)?\s*$', '', opponent_name_element.text_content()).strip()
-                    games.append({'opponent_display_name': opponent_display_name, 'url': href, 'game_id': game_id})
-        except PlaywrightError as e:
-            # The error will still print here if something goes wrong, which is good for debugging.
-            print(f"        - An error occurred while parsing the schedule table: {e}")
-        return games
-    # --- REFACTORED game stats parser (to use the new return format) ---
-    # Paste this entire method into your class, replacing the old one.
-    def _parse_yahoo_box_score(self, box_score_url, year, main_team_db_id, opponent_team_id, main_team_name, opponent_team_name):
-        print(f"           - Parsing {self.YAHOO_BASE_URL}{box_score_url}")
-        try:
-            # Increased timeout and used 'domcontentloaded' as the page is JS-heavy
-            self.page.goto(f"{self.YAHOO_BASE_URL}{box_score_url}", wait_until="domcontentloaded", timeout=90000)
-            # Wait for the main stats container to be present to ensure the page has loaded
-            match_stats_container = self.page.locator("div.match-stats")
-            match_stats_container.wait_for(timeout=30000)
-        except PlaywrightError as e:
-            print(f"           - CRITICAL Error navigating to or loading box score page: {e}")
-            return
-
-        source_game_id_match = re.search(r'-(\d{10,})/?$', box_score_url)
-        if not source_game_id_match:
-            print("           - CRITICAL WARNING: Could not extract Yahoo Game ID from URL. Skipping game.")
-            return
-        source_game_id = source_game_id_match.group(1)
-
-        players_saved_this_game = set()
-        try:
-            # --- Team Name and ID Mapping ---
-            # This selector targets the specific container for the team headers
-            team_header_container = match_stats_container.locator("div.D\\(f\\).Mx\\(-10px\\).Jc\\(sb\\).Pt\\(16px\\)")
-            team_headers = team_header_container.locator("a").all()
-            if len(team_headers) != 2:
-                print(f"           - Could not find the two team headers. Aborting parse for this game.")
-                return
-
-            left_team_name = team_headers[0].text_content().strip()
-            column_to_team_id = {}
-            # Simple check to see which team is in the left column
-            if main_team_name in left_team_name:
-                column_to_team_id[0] = main_team_db_id
-                column_to_team_id[1] = opponent_team_id
-            else:
-                column_to_team_id[0] = opponent_team_id
-                column_to_team_id[1] = main_team_db_id
-
-            # --- Stat Block Parsing ---
-            # This is the key change: Find all direct child divs of 'div.match-stats' that contain a table.
-            # This is much more robust than relying on the fragile utility classes.
-            stat_blocks = match_stats_container.locator("div:has(table.W\\(100\\%\\))").all()
-
-            for block in stat_blocks:
-                tables_in_block = block.locator("table").all()
-                if len(tables_in_block) != 2:
-                    # This block might not be a standard stat block, skip it.
-                    continue
-
-                # --- Category and Header Parsing ---
-                # Get category from the FIRST th in the FIRST table's header
-                first_table_headers = tables_in_block[0].locator("thead th").all()
-                if not first_table_headers:
-                    continue
-
-                category = first_table_headers[0].text_content().strip()
-                # Get the stat names and their abbreviations (from the 'title' attribute)
-                header_names = [th.get_attribute('title')  for th in first_table_headers[1:]]
-                header_abbreviations = [th.text_content().strip() or '' for th in first_table_headers[1:]]
-
-                # Defensive check for empty category
-                if not category:
-                    print("           - WARNING: Found a stat block with no category name. Skipping.")
-                    continue
-
-                stat_def_id = self.db.get_or_create_stat_definition(
-                    self.sport_id, category, header_names, header_abbreviations
-                )
-                if not stat_def_id:
-                    print(f"           - WARNING: Could not get/create stat definition for category '{category}'.")
-                    continue
-
-                # Process each of the two tables in the block
-                for i, table in enumerate(tables_in_block):
-                    team_id = column_to_team_id[i]
-                    opponent_id = column_to_team_id[1 - i]
-
-                    player_rows = table.locator("tbody tr").all()
-                    for row in player_rows:
-                        player_anchor = row.locator("th a").first
-                        player_name = player_anchor.text_content().strip()
-                        player_url = player_anchor.get_attribute('href')
-
-                        player_source_id_match = re.search(r'/(\d+)', player_url or '')
-                        player_source_id = player_source_id_match.group(1) if player_source_id_match else None
-
-                        if not all([player_name, player_source_id]):
+                        if not parsing_mode:
+                            # Should not happen if one of the try-except blocks succeeded or continued
+                            print(f"        Could not determine parsing mode for {full_name} - {year}.")
                             continue
 
-                        player_db_id = self.db.get_or_create_player(self.sport_id, player_name, player_source_id)
-                        if player_db_id:
-                            players_saved_this_game.add(player_db_id)
+                        # Pass the main team's full name for opponent disambiguation in list_view
+                        box_score_games = self._parse_yahoo_schedule_for_box_scores(page, parsing_mode, full_name)
 
-                            # Get all stat values for the current player row
-                            stat_values = [td.text_content().strip() for td in row.locator("td").all()]
+                        if not box_score_games:
+                            print(f"        - [{full_name}] No completed games found for {year} (mode: {parsing_mode}).")
+                            continue
 
-                            self.db.insert_player_game_stats(
-                                player_id=player_db_id, team_id=team_id, opponent_team_id=opponent_id,
-                                season=year, season_type="Regular", source_game_id=source_game_id,
-                                stat_def_id=stat_def_id, stat_values=stat_values
-                            )
+                        print(f"        - [{full_name}] Found {len(box_score_games)} games for {year}. Scraping in parallel...")
 
-            if players_saved_this_game:
-                print(f"           - Success: Parsed and saved stats for {len(players_saved_this_game)} unique players.")
-            else:
-                print(f"           - CRITICAL WARNING: Finished parsing, but ZERO players were saved for this game.")
+                        with ThreadPoolExecutor(max_workers=game_threads) as game_executor:
+                            futures = [
+                                game_executor.submit(self._scrape_one_box_score_worker, game, year, team_db_id, full_name)
+                                for game in box_score_games
+                            ]
+                            for future in futures:
+                                future.result()
+                    break
+                except (PlaywrightError, ValueError) as e:
+                    print(f"  - ATTEMPT FAILED for team {full_name} with error: {e}")
+                    if attempt < max_retries - 1:
+                        print("  - Retrying...")
+                        time.sleep(5)
+                    else:
+                        print(f"  - MAX RETRIES REACHED for {full_name}. This team failed.")
+                        traceback.print_exc()
+                finally:
+                    page.close()
+                    browser.close()
 
-        except PlaywrightError as e:
-            print(f"           - CRITICAL Error parsing box score page: {e}")
-        except Exception as e:
-            # Catch other potential errors during parsing
-            import traceback
-            print(f"           - An unexpected error occurred: {e}")
-            traceback.print_exc()
-    def _parse_nba_box_score(self, box_score_url, year, main_team_db_id, opponent_team_id, main_team_name, opponent_team_name):
+    def _scrape_one_box_score_worker(self, game, year, team_db_id, team_name):
         """
-        SPECIALIZED PARSER for the unique NBA box score page layout.
+        Self-contained worker to scrape a single box score.
+        Now includes its own error handling to prevent the thread from crashing.
         """
-        print(f"           - Parsing (NBA SPECIFIC) {self.YAHOO_BASE_URL}{box_score_url}")
+        game_id = game['game_id']
+        with self.scraped_games_lock:
+            if game_id in self.scraped_games:
+                # print(f"        -> Skipping already processed game {game_id}")
+                return True # Return True for a successful skip
+
+        opponent_full_name = self.display_to_full_name_map.get(game['opponent_display_name'])
+        if not opponent_full_name:
+            return True # Not an error, just no mapping for this opponent
+        opponent_slug = self.full_name_to_slug_map.get(opponent_full_name)
+        if not opponent_slug:
+            return True # Not an error
+
+        opponent_team_id = self.db.get_or_create_team(self.sport_id, opponent_full_name, opponent_slug)
+
+        print(f"        -> Scraping Box Score vs {opponent_full_name} (ID: {game_id})")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context()
+            page = context.new_page()
+
+            # --- THE FIX IS HERE: Wrap the parsing logic in a try/except block ---
+            try:
+                href_from_schedule = game['url']
+                if href_from_schedule.startswith("http://") or href_from_schedule.startswith("https://"):
+                    full_url = href_from_schedule
+                else:
+                    # Ensure leading slashes are handled correctly if it's a relative path
+                    if href_from_schedule.startswith("/"):
+                        full_url = f"{self.YAHOO_BASE_URL}{href_from_schedule}"
+                    else:
+                        full_url = f"{self.YAHOO_BASE_URL}/{href_from_schedule}"
+
+                print(f"           Navigating to box score: {full_url}") # Add this print for debugging
+                page.goto(full_url, wait_until="domcontentloaded", timeout=60000)
+
+                # This is where your _parse_odds_information is called
+                # It will correctly return None if it fails all retries.
+                odds_data = self._parse_odds_information(page)
+                team_stats_data = self._parse_team_stats(page)
+
+                if odds_data:
+                    home_team_odds_name, away_team_odds_name, home_ml, away_ml, spread, total = odds_data
+                    # Determine home/away based on the names returned from the odds table
+                    if team_name in home_team_odds_name:
+                        home_team_id, away_team_id = team_db_id, opponent_team_id
+                    else:
+                        home_team_id, away_team_id = opponent_team_id, team_db_id
+
+                    self.db.insert_game_details(
+                        game_id, self.sport_id, home_team_id, away_team_id,
+                        spread, total, home_ml, away_ml, team_stats_data
+                    )
+                    print(f"           - Success: Saved game details for game {game_id}.")
+                else:
+                    # This is a graceful failure. The function returned None as designed.
+                    print(f"           - Warning: Could not parse odds info for game {game_id}.")
+
+                # Now parse player stats
+                self._parse_player_stats(page, team_db_id, opponent_team_id, team_name, game_id, year)
+
+                with self.scraped_games_lock:
+                    self.scraped_games.add(game_id)
+
+                return True # Indicate success for this worker task
+
+            except Exception as e:
+                # This is a broader catch for any unexpected errors (like navigation failure)
+                print(f"        -! UNEXPECTED WORKER FAILURE for game {game_id}. Error: {e}")
+                traceback.print_exc()
+                return False # Indicate failure for this worker task
+
+            finally:
+                # This block will always run, ensuring the browser is closed.
+                page.close()
+                context.close()
+                browser.close()
+    def _parse_nba_box_score(self, page: Page, box_score_url, year, main_team_db_id, opponent_team_id, main_team_name, opponent_team_name):
         try:
-            self.page.goto(f"{self.YAHOO_BASE_URL}{box_score_url}", wait_until="domcontentloaded", timeout=60000)
-            # The main container for NBA stats is div.player-stats
-            main_container = self.page.locator("div.player-stats").first
+            page.goto(f"{self.YAHOO_BASE_URL}{box_score_url}", wait_until="domcontentloaded", timeout=60000)
+            main_container = page.locator("div.player-stats").first
             main_container.wait_for(timeout=30000)
         except PlaywrightError as e:
             print(f"           - CRITICAL Error navigating to or loading NBA box score page: {e}")
@@ -470,14 +263,12 @@ class YAHOOScraper:
 
         players_saved_this_game = set()
         try:
-            # --- Team Name and ID Mapping for NBA ---
             team_headers = main_container.locator("div.ys-section-header h3 span.Va\\(m\\)").all_text_contents()
             if len(team_headers) < 2:
                 print(f"           - Could not find the two NBA team headers. Aborting parse for this game.")
                 return
 
             column_to_team_id = {}
-            # The main team name might contain the city name from the header (e.g. "Boston Celtics" contains "Boston")
             if any(h in main_team_name for h in team_headers[0].split()):
                 column_to_team_id[0] = main_team_db_id
                 column_to_team_id[1] = opponent_team_id
@@ -485,14 +276,12 @@ class YAHOOScraper:
                 column_to_team_id[0] = opponent_team_id
                 column_to_team_id[1] = main_team_db_id
 
-            # --- Stat Block Parsing for NBA ---
             all_team_stat_blocks = main_container.locator("div.Mt\\(21px\\)").all()
             if len(all_team_stat_blocks) < 2: return
 
             for i, team_block in enumerate(all_team_stat_blocks):
                 team_id = column_to_team_id[i]
                 opponent_id = column_to_team_id[1 - i]
-
                 stat_tables = team_block.locator("table").all()
                 for table in stat_tables:
                     header_cells = table.locator("thead th").all()
@@ -502,9 +291,7 @@ class YAHOOScraper:
                     header_names = [th.get_attribute('title') for th in header_cells[1:]]
                     header_abbreviations = [th.text_content().strip() for th in header_cells[1:]]
 
-                    stat_def_id = self.db.get_or_create_stat_definition(
-                        self.sport_id, category, header_names, header_abbreviations
-                    )
+                    stat_def_id = self.db.get_or_create_stat_definition(self.sport_id, category, header_names, header_abbreviations)
                     if not stat_def_id: continue
 
                     for row in table.locator("tbody tr").all():
@@ -521,18 +308,475 @@ class YAHOOScraper:
 
                         players_saved_this_game.add(player_db_id)
                         stat_values = [td.text_content().strip() for td in row.locator("td").all()]
-
                         self.db.insert_player_game_stats(
                             player_id=player_db_id, team_id=team_id, opponent_team_id=opponent_id,
-                            season=year, season_type="Regular", source_game_id=source_game_id,
+                            season=year, source_game_id=source_game_id,
                             stat_def_id=stat_def_id, stat_values=stat_values
                         )
 
             if players_saved_this_game:
-                print(f"           - Success: Parsed and saved stats for {len(players_saved_this_game)} unique players.")
+                print(f"           - Success [Thread-{threading.get_ident()}]: Parsed and saved stats for {len(players_saved_this_game)} players in game {source_game_id}.")
             else:
-                print(f"           - WARNING: Finished parsing NBA game, but ZERO players were saved.")
+                print(f"           - WARNING [Thread-{threading.get_ident()}]: Finished parsing NBA game, but ZERO players were saved for game {source_game_id}.")
         except Exception as e:
-            import traceback
             print(f"           - An unexpected error occurred in the NBA parser: {e}")
             traceback.print_exc()
+    # In YAHOOScraper class:
+    def _parse_yahoo_schedule_for_box_scores(self, page: Page, parsing_mode: str, current_team_full_name: str):
+        """
+        Parses a team's schedule page to find links to completed game box scores.
+        Handles different page structures based on parsing_mode.
+        'current_team_full_name' is the name of the team whose schedule is being parsed.
+        """
+        games = []
+        print(f"        Parsing schedule with mode: {parsing_mode}")
+
+        if parsing_mode == 'table_view':
+            # --- Logic for the TABLE structure (similar to your previous refined version) ---
+            schedule_table_rows_selector = "div[data-testid='sched-filter-results'] table tbody tr"
+            try:
+                print(f"        - Locating rows with table selector: {schedule_table_rows_selector}")
+                rows = page.locator(schedule_table_rows_selector).all()
+                if not rows:
+                    # Fallback if the primary table selector changed slightly
+                    fallback_table_selector = "table.latest-results-table tbody tr"
+                    print(f"        - Primary table selector found no rows. Trying fallback: {fallback_table_selector}")
+                    rows = page.locator(fallback_table_selector).all()
+
+                print(f"        - Found {len(rows)} potential game rows in table view.")
+                for i, row in enumerate(rows):
+                    row_text_content = row.text_content()
+                    print(f"          Processing table row {i+1}: {row_text_content[:100]}...")
+
+                    if "Bye Week" in row_text_content or \
+                            "(Preseason)" in row_text_content or \
+                            any(status in row_text_content for status in ["Postponed", "Canceled", "Suspended", "TBD"]):
+                        print(f"            Skipping row (status/type): {row_text_content[:50]}")
+                        continue
+
+                    # Link finding (adjust as needed from your previous robust version)
+                    box_score_link = row.locator('td a[href*="/gamelog/"], td a[href*="/recap?"], td a[href*="/boxscore"], td:first-child a[href], td:nth-child(2) a[href]').first
+                    if not box_score_link.is_visible(timeout=500):
+                        print(f"        - Warning: No visible box score link in table row: {row_text_content[:100]}")
+                        continue
+
+                    href = box_score_link.get_attribute('href')
+                    if not href or not re.search(r'/([a-z0-9-]+-\d{8,})/?$', href): # More general game ID pattern
+                        print(f"        - Warning: Link href doesn't look like a box score: {href}. Skipping row.")
+                        continue
+
+                    game_id_match = re.search(r'-(\d{8,})/?$', href)
+                    if not game_id_match: # Should be caught by previous check, but good to be safe
+                        print(f"        - Warning: Could not extract game_id from href: {href}")
+                        continue
+                    game_id = game_id_match.group(1)
+
+                    # Opponent name finding for table view
+                    opponent_cell_candidate_selectors = [
+                        "td:nth-child(2) span[data-tst='opponent-name']",
+                        "td:nth-child(3) span[data-tst='opponent-name']", # Sometimes it's the 3rd child
+                        "td:nth-child(2) a > span",
+                        "td:nth-child(3) a > span",
+                        "td:nth-child(3) > span > span:first-child", # Your original
+                        "td:has-text('@') span",
+                        "td:has-text('vs') span"
+                    ]
+                    opponent_display_name = "Unknown Opponent"
+                    for opp_sel in opponent_cell_candidate_selectors:
+                        opponent_name_element = row.locator(opp_sel).first
+                        if opponent_name_element.is_visible(timeout=200):
+                            name_text = opponent_name_element.text_content().strip()
+                            name_text = re.sub(r'\s*\d+-\d+(-\d+)?\s*$', '', name_text).strip()
+                            name_text = re.sub(r'\s+\d+$', '', name_text).strip()
+                            if name_text and len(name_text) > 1 : # Avoid single letters or empty strings
+                                opponent_display_name = name_text
+                                break
+
+                    print(f"          Found game (table): ID={game_id}, Opponent={opponent_display_name}, URL={href}")
+                    games.append({'opponent_display_name': opponent_display_name, 'url': href, 'game_id': game_id})
+
+            except PlaywrightError as e:
+                print(f"        - An error occurred while parsing schedule table view: {e}")
+                page.screenshot(path=f"debug_schedule_table_error_{page.title().replace(' ','_')}.png")
+                print(f"        - Screenshot saved to debug_schedule_table_error_{page.title().replace(' ','_')}.png")
+
+        elif parsing_mode == 'list_view':
+            # --- Logic for the div#schedule-list structure ---
+            # Each game is an <li> with class e.g. "_ys_sjaa1b _ys_1lru6g2"
+            # The link is <a class="_ys_1vd099q">
+            # Team names are in <span class="_ys_y2r9ts">
+
+            list_item_selector = "div#schedule-list li"
+            try:
+                print(f"        - Locating items with list selector: {list_item_selector}")
+                list_items = page.locator(list_item_selector).all()
+                print(f"        - Found {len(list_items)} potential game list items.")
+
+                for i, item in enumerate(list_items):
+                    item_text_content = item.text_content()
+                    # print(f"          Processing list item {i+1}: {item_text_content[:150]}...")
+
+                    # Check for game status like Ppd (Postponed), Canceled, etc.
+                    # These might be within a span with id="game-state" or similar
+                    game_state_element = item.locator("div#game-state span, span").first # Check for specific status spans
+                    game_state_text = ""
+                    if game_state_element.is_visible(timeout=100):
+                        game_state_text = game_state_element.text_content().strip().upper()
+
+                    if any(status in game_state_text for status in ["PPD", "POSTPONED", "CANCELED", "CANCELLED", "SUSPENDED", "TBD"]):
+                        print(f"            Skipping list item (status: {game_state_text}): {item_text_content[:50]}")
+                        continue
+
+                    # Check if it's a "Bye Week" or "Preseason" if such text exists directly in item
+                    if "Bye Week" in item_text_content or "(Preseason)" in item_text_content:
+                        print(f"            Skipping list item (type): {item_text_content[:50]}")
+                        continue
+
+                    link_element = item.locator("a").first
+                    if not link_element.is_visible(timeout=500):
+                        print(f"        - Warning: No visible link element in list item: {item_text_content[:100]}")
+                        continue
+
+                    href = link_element.get_attribute('href')
+                    if not href or not re.search(r'/([a-z0-9-]+-\d{8,})/?$', href):
+                        print(f"        - Warning: Link href in list item doesn't look like a box score: {href}. Skipping item.")
+                        continue
+
+                    game_id_match = re.search(r'-(\d{8,})/?$', href)
+                    if not game_id_match:
+                        print(f"        - Warning: Could not extract game_id from list item href: {href}")
+                        continue
+                    game_id = game_id_match.group(1)
+
+                    # Extract both team names
+                    team_name_elements = item.locator("span._ys_y2r9ts").all_text_contents()
+                    # Clean the names: " Baltimore Orioles BAL " -> "Baltimore Orioles"
+                    cleaned_team_names = [re.sub(r'\s+[A-Z]{2,3}\s*$', '', name).strip() for name in team_name_elements]
+
+                    opponent_display_name = "Unknown Opponent"
+                    if len(cleaned_team_names) == 2:
+                        # We need to identify which of the two is the opponent.
+                        # current_team_full_name is the team whose schedule page we are on.
+                        if current_team_full_name.lower() in cleaned_team_names[0].lower():
+                            opponent_display_name = cleaned_team_names[1]
+                        elif current_team_full_name.lower() in cleaned_team_names[1].lower():
+                            opponent_display_name = cleaned_team_names[0]
+                        else:
+                            # This case means current_team_full_name didn't match either,
+                            # which could happen if team names are slightly different.
+                            # As a fallback, assume the second team is the opponent if the first contains "vs" or "@",
+                            # or just pick one if context isn't clear. For now, let's be cautious.
+                            print(f"          Warning: Could not reliably determine opponent for {current_team_full_name} from names: {team_name_elements}")
+                            # Heuristic: if one team name contains "vs" or "@", the other is the main team.
+                            # This part of the HTML is complex, so we're taking the first one that's NOT the current team.
+                            if current_team_full_name not in team_name_elements[0]:
+                                opponent_display_name = cleaned_team_names[0]
+                            else:
+                                opponent_display_name = cleaned_team_names[1]
+
+
+                    elif len(cleaned_team_names) == 1: # Could happen if it's a "vs TeamX" format somewhere else
+                        opponent_display_name = cleaned_team_names[0]
+                    else:
+                        print(f"          Warning: Found {len(cleaned_team_names)} team names in list item. Expected 2. Names: {team_name_elements}")
+                        # Attempt to find opponent name via other common patterns within the list item
+                        opponent_search_elements = item.locator("div._ys_tx32sl span._ys_y2r9ts").all()
+                        potential_opponents = []
+                        for el in opponent_search_elements:
+                            name_text = el.text_content().strip()
+                            name_text = re.sub(r'\s+[A-Z]{2,3}\s*$', '', name_text).strip()
+                            if name_text and name_text.lower() not in current_team_full_name.lower() and len(name_text) > 1:
+                                potential_opponents.append(name_text)
+                        if potential_opponents:
+                            opponent_display_name = potential_opponents[0] # Take the first non-current team name found
+                        else:
+                            print(f"          Could not identify opponent name in list item: {item_text_content[:100]}")
+                            continue # Skip if no opponent found
+
+                    # Final check if game is still marked as "To Be Determined" or similar after score parsing
+                    if "TBD" in item.locator("._ys_1yxp8my").text_content().upper(): # Check game date/time area
+                        print(f"            Skipping list item (still TBD): {item_text_content[:50]}")
+                        continue
+                    if not item.locator("div._ys_1gl9ke6").all_text_contents(): # No scores present
+                        print(f"            Skipping list item (no scores found, likely not played): {item_text_content[:50]}")
+                        continue
+
+                    print(f"          Found game (list): ID={game_id}, Opponent={opponent_display_name}, URL={href}")
+                    games.append({'opponent_display_name': opponent_display_name, 'url': href, 'game_id': game_id})
+
+            except PlaywrightError as e:
+                print(f"        - An error occurred while parsing schedule list view: {e}")
+                page.screenshot(path=f"debug_schedule_list_error_{page.title().replace(' ','_')}.png")
+                print(f"        - Screenshot saved to debug_schedule_list_error_{page.title().replace(' ','_')}.png")
+
+        else:
+            print(f"        - Unknown parsing_mode: {parsing_mode}")
+
+        if not games:
+            print(f"        - No games extracted in mode '{parsing_mode}'. Dumping page HTML for review.")
+            try:
+                with open(f"debug_no_games_{parsing_mode}_{page.title().replace(' ','_')[:50]}.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+            except Exception as dump_err:
+                print(f"          Failed to dump HTML: {dump_err}")
+        return games
+    # --- MAIN PARSING SUPERVISOR ---
+    def _parse_yahoo_box_score(self, page: Page, box_score_url, year, main_team_db_id, opponent_team_id, main_team_name, opponent_team_name):
+        """
+        Controller for scraping a single box score page. It navigates and then
+        calls helper functions to parse different sections of the page.
+        """
+        try:
+            full_url = f"{self.YAHOO_BASE_URL}{box_score_url}"
+            page.goto(full_url, wait_until="domcontentloaded", timeout=90000)
+            team_headers_locator = page.locator("div.match-stats")
+            team_headers_locator1 = page.locator("div.match-stats .D\\(f\\).Jc\\(sb\\) a").nth(1)
+
+            # Add fallbacks for specific stat tables
+            passing_header_locator = page.locator("div.match-stats h4:has-text('PASSING')")
+            batting_header_locator = page.locator("div.match-stats h4:has-text('BATTING')")
+
+            # Combine them into a single super-locator
+            # This tells Playwright to wait for ANY of these to become visible.
+            reliable_content_locator = team_headers_locator.or_(team_headers_locator1).or_(passing_header_locator).or_(batting_header_locator)
+
+            # Now, wait for the first element found by any of these strategies to be visible.
+            reliable_content_locator.first.wait_for(state="visible", timeout=30000)
+
+            # We wait for the first element matching ANY of these strategies to be visible.
+
+            print(f"           - Box score content loaded.")
+            page.locator("div.match-stats").wait_for(state="visible", timeout=30000)
+        except PlaywrightError as e:
+            print(f"           - CRITICAL Error navigating to or loading main page container: {e}")
+            return
+
+        source_game_id_match = re.search(r'-(\d{8,})/?$', box_score_url)
+        if not source_game_id_match: return
+        source_game_id = source_game_id_match.group(1)
+
+        odds_data = self._parse_odds_information(page)
+        team_stats_data = self._parse_team_stats(page)
+
+        if odds_data:
+            home_team_odds_name, away_team_odds_name, home_ml, away_ml, spread, total = odds_data
+            if main_team_name in home_team_odds_name:
+                home_team_id, away_team_id = main_team_db_id, opponent_team_id
+            else:
+                home_team_id, away_team_id = opponent_team_id, main_team_db_id
+
+            self.db.insert_game_details(
+                source_game_id, self.sport_id, home_team_id, away_team_id,
+                spread, total, home_ml, away_ml, team_stats_data
+            )
+            print(f"           - Success: Saved game details for game {source_game_id}.")
+        else:
+            print(f"           - Warning: Could not parse odds info for game {source_game_id}.")
+
+        self._parse_player_stats(page, main_team_db_id, opponent_team_id, main_team_name, source_game_id,year)
+
+    # --- HELPER PARSERS ---
+
+    def _parse_odds_information(self, page: Page):
+        """
+        Parses odds with a retry mechanism. If an attempt fails, it will
+        reload the page and try again up to a specified number of times.
+        It handles both completed and upcoming game pages and provides detailed debugging.
+        """
+        max_attempts = 3
+        retry_delay_seconds = 3  # Wait 3 seconds between retries
+
+        for attempt in range(max_attempts):
+            try:
+                print(f"--- Attempt {attempt + 1} of {max_attempts} ---")
+
+                # --- STEP 1: Click the Odds tab ---
+                odds_button = page.locator('button[data-tst="game_odds"]')
+                # Use a longer timeout on the first, most crucial interaction
+
+                expect(odds_button).to_be_visible(timeout=15000)
+                odds_button.click()
+
+                # --- STEP 2: Wait for the main container ---
+                betsheet = page.locator("div#betsheet").first
+                expect(betsheet).to_be_visible(timeout=10000)
+
+                # --- STEP 3: Check for the "No Bets Available" state (for completed games) ---
+                no_bets_container = betsheet.locator("div.empty-odds")
+                try:
+                    # Use a short timeout here. If this element exists, we want to know quickly.
+                    expect(no_bets_container).to_be_visible(timeout=3000)
+                    print("INFO: 'No Bets Available' container found. This game is likely complete.")
+                except Exception:
+                    # If the "no_bets_container" is NOT found, we proceed to parse the odds.
+                    print("INFO: 'No Bets Available' not found, proceeding to parse odds table...")
+
+                # --- STEP 4: Wait for a stable element in the odds table ---
+                home_team_container = betsheet.locator("div.sixpack-home-team").first
+                expect(home_team_container).to_be_visible(timeout=10000)
+
+                # --- STEP 5: Parse all data ---
+                away_row = betsheet.locator("tr:has(div.sixpack-away-team)").first
+                home_row = betsheet.locator("tr:has(div.sixpack-home-team)").first
+                away_team_name = away_row.locator("span.Fw\\(600\\)").first.text_content().strip()
+                home_team_name = home_row.locator("span.Fw\\(600\\)").first.text_content().strip()
+
+                home_ml_text = home_row.locator("td").nth(1).inner_text()
+                away_ml_text = away_row.locator("td").nth(1).inner_text()
+                home_spread_text = home_row.locator("td").nth(2).inner_text()
+                total_text = home_row.locator("td").nth(3).inner_text()
+
+                # --- STEP 6: Use regex to reliably extract numbers ---
+                home_ml_match = re.search(r'([+\-–−]\d+)', home_ml_text)
+                away_ml_match = re.search(r'([+\-–−]\d+)', away_ml_text)
+                spread_match = re.search(r'([+\-–−]\d+\.?\d*)', home_spread_text)
+                total_match = re.search(r'[OUou]\s*(\d+\.?\d*)', total_text)
+
+                if not all([home_ml_match, away_ml_match, spread_match, total_match]):
+                    raise ValueError("Failed to find all odds values with regex after content loaded.")
+
+                home_moneyline = int(home_ml_match.group(1).replace('–', '-').replace('−', '-'))
+                away_moneyline = int(away_ml_match.group(1).replace('–', '-').replace('−', '-'))
+                spread = float(spread_match.group(1).replace('–', '-').replace('−', '-'))
+                total = float(total_match.group(1))
+
+                # --- SUCCESS! ---
+                # If we get here, everything worked. Return the data and exit the function.
+                print(f"Success on attempt {attempt + 1}!")
+                return home_team_name, away_team_name, home_moneyline, away_moneyline, spread, total
+
+            except Exception as e:
+                # --- HANDLE FAILED ATTEMPT ---
+                print(f"Error on attempt {attempt + 1} of {max_attempts}: {type(e).__name__}")
+
+                # If this was not the last attempt, reload and wait before trying again.
+                if attempt < max_attempts - 1:
+                    print(f"Reloading page and retrying in {retry_delay_seconds} seconds...")
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=20000)
+                        time.sleep(retry_delay_seconds)
+                    except Exception as reload_error:
+                        print(f"Page reload failed: {reload_error}. Aborting.")
+                        break # Exit the loop if reload fails
+                else:
+                    # This was the final attempt. Print the detailed failure message.
+                    print(f"\n\n\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                    print(f"!!!!!!   ALL {max_attempts} ATTEMPTS FAILED. SEE DETAILS.   !!!!!!")
+                    print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                    print(f"URL at time of failure: {page.url}")
+                    print(f"FINAL ERROR TYPE: {type(e).__name__}")
+                    print(f"FINAL ERROR DETAILS: {e}")
+
+                    screenshot_path = "final_debug_odds_failure.png"
+                    html_path = "final_debug_odds_failure.html"
+                    page.screenshot(path=screenshot_path, full_page=True)
+                    with open(html_path, "w", encoding="utf-8") as f:
+                        f.write(page.content())
+
+                    print(f"\n--- DEBUG ARTIFACTS SAVED ---")
+                    print(f"Screenshot of the page saved to: '{screenshot_path}'")
+                    print(f"Full HTML of the page saved to: '{html_path}'")
+                    print(f"--- Please inspect these files to see what the scraper saw. ---\n\n\n")
+
+                    return None
+
+        # This line is reached only if the loop completes without a successful return,
+        # which shouldn't happen with the logic above, but is a safe fallback.
+        return None
+    def _parse_team_stats(self, page: Page):
+        """Parses team stats after explicitly navigating to the team stats tab."""
+        team_stats = {}
+        try:
+            team_stats_button = page.locator('button[data-tst="teamcomparison"]')
+            team_stats_button.wait_for(state="visible", timeout=10000)
+            team_stats_button.click()
+
+            stats_container = page.locator("div.ys-boxscore-teamstats").first
+            stats_container.wait_for(state="visible", timeout=10000)
+
+            stat_rows = stats_container.locator("tbody tr").all()
+            for row in stat_rows:
+                cols = row.locator("td").all()
+                if len(cols) != 3: continue
+                away_val_text = cols[0].text_content().strip()
+                stat_name = cols[1].text_content().strip()
+                home_val_text = cols[2].text_content().strip()
+                # Create a nested structure for clarity
+                team_stats[stat_name] = {'home': home_val_text, 'away': away_val_text}
+            return team_stats
+        except Exception as e:
+            print(f"           - Warning: Could not parse team stats table. Error: {e}")
+            return None
+
+    def _parse_player_stats(self, page: Page, main_team_db_id, opponent_team_id, main_team_name, source_game_id,year):
+        """Explicitly navigates to and parses only the player stats."""
+        try:
+            player_stats_button = page.locator('button[data-tst="stats"], button[data-tst="matchstats"]').first
+            player_stats_button.wait_for(state="visible", timeout=10000)
+            player_stats_button.click()
+
+            match_stats_container = page.locator("div.match-stats")
+            match_stats_container.wait_for(state="visible", timeout=10000)
+
+            team_headers = match_stats_container.locator("div.D\\(f\\).Mx\\(-10px\\) a").all()
+            if len(team_headers) < 2:
+                print(f"           - Could not find team headers in player stats tab for game {source_game_id}.")
+                return
+
+            left_team_name = team_headers[0].text_content().strip()
+            column_to_team_id = {}
+            if main_team_name in left_team_name:
+                column_to_team_id[0] = main_team_db_id
+                column_to_team_id[1] = opponent_team_id
+            else:
+                column_to_team_id[0] = opponent_team_id
+                column_to_team_id[1] = main_team_db_id
+
+            players_saved_this_game = set()
+            stat_blocks = match_stats_container.locator("div:has(table.W\\(100\\%\\))").all()
+            for block in stat_blocks:
+                tables_in_block = block.locator("table").all()
+                if len(tables_in_block) != 2: continue
+
+                header_info = tables_in_block[0].locator("thead th").all()
+                if not header_info: continue
+
+                category = header_info[0].text_content().strip()
+                header_names = [th.get_attribute('title') or th.text_content().strip() for th in header_info[1:]]
+                header_abbreviations = [th.text_content().strip() for th in header_info[1:]]
+
+                stat_def_id = self.db.get_or_create_stat_definition(self.sport_id, category, header_names, header_abbreviations)
+                if not stat_def_id: continue
+
+                for i, table in enumerate(tables_in_block):
+                    team_id = column_to_team_id[i]
+                    opponent_id = column_to_team_id[1 - i]
+                    for row in table.locator("tbody tr").all():
+                        player_anchor = row.locator("th a").first
+                        if not player_anchor.is_visible(): continue
+
+                        player_name = player_anchor.text_content().strip()
+                        if "TOTAL" in player_name.upper(): continue
+
+                        player_url = player_anchor.get_attribute('href')
+                        player_source_id_match = re.search(r'/(\d+)', player_url or '')
+                        if not player_source_id_match: continue
+
+                        player_db_id = self.db.get_or_create_player(self.sport_id, player_name, player_source_id_match.group(1))
+                        if not player_db_id: continue
+
+                        players_saved_this_game.add(player_db_id)
+                        stat_values = [td.text_content().strip() for td in row.locator("td").all()]
+                        self.db.insert_player_game_stats(
+                            player_id=player_db_id, team_id=team_id, opponent_team_id=opponent_id,
+                            season=year, source_game_id=source_game_id,
+                            stat_def_id=stat_def_id, stat_values=stat_values
+                        )
+
+            if players_saved_this_game:
+                print(f"           - Success: Parsed player stats for {len(players_saved_this_game)} players in game {source_game_id}.")
+            else:
+                print(f"           - WARNING: Found no players in player stats tab for game {source_game_id}.")
+
+        except Exception as e:
+            print(f"           - CRITICAL Error during player stat parsing for game {source_game_id}: {e}")
