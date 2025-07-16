@@ -160,6 +160,7 @@ class DatabaseManager:
         """
         Fetches all player game logs for a given sport and season, joining
         all necessary tables to create a comprehensive DataFrame.
+        *** UPDATED to include opponent_team_id ***
         """
         print(f"Fetching game logs for {sport_name} season {season}...")
         query = """
@@ -168,6 +169,7 @@ class DatabaseManager:
                     p.source_id as player_source_id,
                     t.name AS team_name,
                     opp.name AS opponent_team_name,
+                    pgs.opponent_team_id, -- <<< --- ADD THIS LINE
                     pgs.season,
                     pgs.source_game_id,
                     sd.category_name,
@@ -196,14 +198,16 @@ class DatabaseManager:
 
         processed_data = []
         for row in raw_data:
-            (full_name, player_source_id, team_name, opponent_team_name, season_val, game_id,
-             category_name, stat_names, stat_values,
+            # The new opponent_team_id will be in the row tuple
+            (full_name, player_source_id, team_name, opponent_team_name, opponent_team_id,
+             season_val, game_id, category_name, stat_names, stat_values,
              vegas_spread, vegas_total, home_ml, away_ml, is_home_game) = row
             for i, name in enumerate(stat_names):
                 clean_name = f"{category_name.lower().replace(' ', '_')}_{name.lower().replace(' ', '_')}"
                 try:
                     stat_record = {
                         'player_name': full_name, 'team': team_name, 'opponent': opponent_team_name,
+                        'opponent_team_id': opponent_team_id, # <<< --- ADD THIS
                         'season': season_val, 'game_id': game_id, 'vegas_spread': vegas_spread,
                         'vegas_total': vegas_total, 'home_moneyline': home_ml, 'away_moneyline': away_ml,
                         'is_home_game': is_home_game, 'stat_name': clean_name,
@@ -219,8 +223,9 @@ class DatabaseManager:
 
         df = pd.DataFrame(processed_data)
         try:
+            # Add opponent_team_id to the list of columns to pivot on
             index_cols = [
-                'player_name', 'team', 'opponent', 'season', 'game_id',
+                'player_name', 'team', 'opponent', 'opponent_team_id', 'season', 'game_id', # <<<--- ADD THIS
                 'vegas_spread', 'vegas_total', 'home_moneyline', 'away_moneyline', 'is_home_game'
             ]
             final_df = df.pivot_table(
@@ -231,12 +236,132 @@ class DatabaseManager:
             print(f"An error occurred during pivoting: {e}")
             return pd.DataFrame()
 
-        # Use the centralized helper to ensure consistent column names
         final_df = self._clean_and_rename_game_log_df(final_df)
 
         print(f"Successfully fetched and processed {len(final_df)} game records.")
         return final_df
 
+
+    def fetch_batting_stats_for_game(self, source_game_id, team_id):
+        """
+        Fetches all the raw batting stats for every player on a specific team
+        in a specific game, returning a clean DataFrame.
+
+        Args:
+            source_game_id (str): The unique identifier for the game.
+            team_id (int): The unique identifier for the team whose batters we want.
+
+        Returns:
+            pd.DataFrame: A DataFrame where each row is a player's batting stats
+                          for the game, with columns like 'hitting_at_bats', 'hitting_strikeouts', etc.
+                          Returns an empty DataFrame if no data is found.
+        """
+        query = """
+                SELECT
+                    sd.stat_names,
+                    pgs.stat_values
+                FROM player_game_stats pgs
+                         JOIN stat_definitions sd ON pgs.stat_definition_id = sd.stat_definition_id
+                WHERE pgs.source_game_id = %s
+                  AND pgs.team_id = %s
+                  AND sd.category_name = 'Batting'; \
+                """
+        params = (str(source_game_id), team_id)
+
+        # Execute the query to get a list of tuples, e.g., [ (['AB', 'H'], ['4', '2']), ... ]
+        raw_data = self.execute_query(query, params=params, fetch='all')
+
+        if not raw_data:
+            # If the query returns no players for that team/game, return an empty frame.
+            return pd.DataFrame()
+
+        processed_lineup = []
+        # Each 'player_row' represents one player's performance in the game.
+        for player_row in raw_data:
+            stat_names = player_row[0]  # This is the list of stat names, e.g., ['At Bats', 'Runs', ...]
+            stat_values = player_row[1] # This is the list of stat values, e.g., ['4', '1', ...]
+
+            # Create a dictionary to hold the stats for this single player
+            player_stats_dict = {}
+
+            # Use zip to pair each stat name with its corresponding value
+            for name, value in zip(stat_names, stat_values):
+                # Clean the stat name to be model-friendly, e.g., 'At Bats' -> 'hitting_at_bats'
+                # This matches the format from your _clean_and_rename_game_log_df helper.
+                clean_name = f"hitting_{name.lower().replace(' ', '_')}"
+
+                # Convert the stat value from a string to a number.
+                # 'coerce' will turn any errors (like empty strings) into NaN (Not a Number),
+                # which is what pandas and scikit-learn expect for missing data.
+                numeric_value = pd.to_numeric(value, errors='coerce')
+
+                player_stats_dict[clean_name] = numeric_value
+
+            # Add the fully processed dictionary for this player to our list
+            processed_lineup.append(player_stats_dict)
+
+        # Convert the list of dictionaries into a final, clean DataFrame.
+        lineup_df = pd.DataFrame(processed_lineup)
+
+        # The columns from your stat_definitions table might include long names.
+        # We can reuse the centralized cleaner to ensure consistency.
+        # For batting, it might not change much, but it's excellent practice.
+        final_df = self._clean_and_rename_game_log_df(lineup_df)
+
+        return final_df
+# In database/db_manager.py
+
+    def fetch_all_batting_stats_for_seasons(self, start_year, end_year):
+        """
+        *** V2: REWRITTEN to process data robustly, matching the single-game fetcher. ***
+        Fetches ALL batting stats for ALL players across a range of seasons.
+        """
+        print("  Executing bulk fetch for all batting stats (V2)...")
+        query = """
+                SELECT
+                    pgs.source_game_id,
+                    pgs.team_id,
+                    p.full_name, -- Use player name to distinguish rows
+                    sd.stat_names,
+                    pgs.stat_values
+                FROM player_game_stats pgs
+                         JOIN stat_definitions sd ON pgs.stat_definition_id = sd.stat_definition_id
+                         JOIN players p ON pgs.player_id = p.player_id -- Join players table
+                WHERE sd.category_name = 'Batting'
+                  AND pgs.season BETWEEN %s AND %s; \
+                """
+        params = (start_year, end_year)
+        raw_data = self.execute_query(query, params=params, fetch='all')
+
+        if not raw_data:
+            return pd.DataFrame()
+
+        processed_records = []
+        # This logic now mirrors the robust single-game fetcher
+        for row in raw_data:
+            game_id, team_id, player_name, stat_names, stat_values = row
+
+            player_stats_dict = {
+                'source_game_id': game_id,
+                'team_id': team_id,
+                'player_name': player_name # Identify each player
+            }
+            for name, value in zip(stat_names, stat_values):
+                clean_name = f"hitting_{name.lower().replace(' ', '_')}"
+                player_stats_dict[clean_name] = pd.to_numeric(value, errors='coerce')
+
+            processed_records.append(player_stats_dict)
+
+        if not processed_records:
+            return pd.DataFrame()
+
+        # No pivot needed! The logic creates the correct structure directly.
+        final_df = pd.DataFrame(processed_records)
+
+        final_df = self._clean_and_rename_game_log_df(final_df)
+
+        print(f"  Bulk fetch complete. Loaded {len(final_df)} individual batting performances.")
+        return final_df
     def fetch_recent_games_for_player(self, player_name, sport_name, n=15):
         """
         Fetches the last N games for a specific player to calculate rolling stats.
@@ -270,6 +395,100 @@ class DatabaseManager:
         df = self._clean_and_rename_game_log_df(df)
         return df
 
+    def fetch_most_recent_lineup_for_team(self, team_name, sport_name, num_games=15):
+        """
+        Finds the most frequent 9 batters for a team over their last N games
+        to serve as a "proxy lineup" for predictions.
+
+        Args:
+            team_name (str): The name of the team.
+            sport_name (str): The sport (e.g., 'MLB').
+            num_games (int): The number of recent games to look back on.
+
+        Returns:
+            list: A list of the 9 player names who appeared most frequently.
+        """
+        print(f"  Fetching proxy lineup for {team_name} based on last {num_games} games...")
+
+        # First, get the most recent N game IDs for the team
+        game_id_query = """
+                        SELECT DISTINCT pgs.source_game_id
+                        FROM player_game_stats pgs
+                                 JOIN teams t ON pgs.team_id = t.team_id
+                        WHERE t.name ILIKE %s
+                        ORDER BY pgs.source_game_id DESC
+                        LIMIT %s; \
+                        """
+        game_ids_raw = self.execute_query(game_id_query, params=(team_name, num_games), fetch='all')
+        if not game_ids_raw:
+            return []
+        game_ids = [row[0] for row in game_ids_raw]
+
+        # Now, find which players appeared most often in those games
+        player_counts_query = """
+                              SELECT p.full_name, COUNT(DISTINCT pgs.source_game_id) as games_played
+                              FROM player_game_stats pgs
+                                       JOIN players p ON pgs.player_id = p.player_id
+                                       JOIN stat_definitions sd ON pgs.stat_definition_id = sd.stat_definition_id
+                              WHERE pgs.source_game_id = ANY(%s)
+                                AND sd.category_name = 'Batting'
+                              GROUP BY p.full_name
+                              ORDER BY games_played DESC
+                              LIMIT 9; -- Get the top 9 most frequent players \
+                              """
+        player_names_raw = self.execute_query(player_counts_query, params=(game_ids,), fetch='all')
+
+        if not player_names_raw:
+            return []
+
+        return [row[0] for row in player_names_raw]
+    def fetch_recent_stats_for_players(self, player_names_list):
+        """
+        Takes a list of player names and fetches their aggregated batting stats
+        over a recent period (e.g., this season or all available data).
+
+        Args:
+            player_names_list (list): A list of strings, e.g., ['Mookie Betts', 'Freddie Freeman'].
+
+        Returns:
+            pd.DataFrame: A DataFrame where each row is a player from the list
+                          and the columns are their summed stats ('hitting_at_bats', etc.).
+        """
+        if not player_names_list:
+            return pd.DataFrame()
+
+        query = """
+                SELECT
+                    p.full_name,
+                    sd.stat_names,
+                    pgs.stat_values
+                FROM player_game_stats pgs
+                         JOIN players p ON pgs.player_id = p.player_id
+                         JOIN stat_definitions sd ON pgs.stat_definition_id = sd.stat_definition_id
+                WHERE sd.category_name = 'Batting'
+                  AND p.full_name = ANY(%s); -- Use = ANY() to find all players in the list \
+                """
+        params = (player_names_list,)
+        raw_data = self.execute_query(query, params=params, fetch='all')
+
+        if not raw_data:
+            return pd.DataFrame()
+
+        processed_records = []
+        for player_name, stat_names, stat_values in raw_data:
+            stat_dict = {'player_name': player_name}
+            for name, value in zip(stat_names, stat_values):
+                clean_name = f"hitting_{name.lower().replace(' ', '_')}"
+                stat_dict[clean_name] = pd.to_numeric(value, errors='coerce')
+            processed_records.append(stat_dict)
+
+        player_df = pd.DataFrame(processed_records)
+
+        # Aggregate all game logs for each player into a single row of stats
+        # Group by player and sum their stats
+        aggregated_df = player_df.groupby('player_name').sum().reset_index()
+
+        return aggregated_df
     def fetch_recent_games_for_team_as_opponent(self, team_name, sport_name, n=50):
         """
         Fetches recent games where a team was the opponent.
@@ -356,3 +575,4 @@ class DatabaseManager:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+

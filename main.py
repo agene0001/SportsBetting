@@ -127,7 +127,7 @@ def run_prediction(db_manager):
                 print("\nCould not generate a prediction for an unknown reason.\n")
 
         elif choice == '2':
-            if not predictor.mlb_model:
+            if not predictor.mlb_models:
                 print("\nERROR: MLB model not found. Please train it first (Main Menu Option 3).")
                 return
 
@@ -142,14 +142,14 @@ def run_prediction(db_manager):
             vegas_total = float(input("Enter the game total (over/under, e.g., 8.5): "))
             team_moneyline = int(input(f"Enter the moneyline for {player_name}'s team (e.g., -180 or +150): "))
             team_spread = float(input(f"Enter the run line for {player_name}'s team (e.g., -1.5 or +1.5): "))
-
+            prizepicks_line = float(input("Enter the PrizePicks line for strikeouts (e.g., 6.5): "))
             game_context = {
                 'is_home_game': is_home_game,
                 'vegas_total': vegas_total,
                 'team_moneyline': team_moneyline,
                 'team_spread': team_spread
             }
-            predictor.predict_pitcher_strikeouts(player_name, opponent_name, game_context)
+            predictor.predict_pitcher_strikeouts_range(player_name, opponent_name, game_context,prizepicks_line)
 
         else:
             return

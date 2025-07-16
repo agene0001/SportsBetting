@@ -707,6 +707,37 @@ class YAHOOScraper:
         except Exception as e:
             print(f"           - Warning: Could not parse team stats table. Error: {e}")
             return None
+    def _parse_summary_dl(self, dl_element):
+        """
+        Parses a <dl> element to extract summary data like Pitches-Strikes.
+        Returns a dictionary mapping player names (as found in the text) to their stats.
+        e.g., {'K Gausman': {'pitches_thrown': 96}, 'T Nance': {...}}
+        """
+        summary_data = {}
+        if dl_element.count() == 0:
+            return summary_data
+
+        all_descriptions = dl_element.locator('dd').all()
+        for dd in all_descriptions:
+            line_text = dd.text_content().strip()
+            data_part = line_text.split(' - ')[-1]
+            player_chunks = data_part.split(',')
+
+            if "Pitches-strikes" in line_text:
+                for chunk in player_chunks:
+                    match = re.search(r"([\w.\s'-]+)\s+(\d+)-(\d+)", chunk)
+                    if match:
+                        # Get the name exactly as it appears in the summary
+                        player_name_in_summary = match.group(1).strip()
+                        summary_data.setdefault(player_name_in_summary, {})['pitches_thrown'] = int(match.group(2))
+                        summary_data.setdefault(player_name_in_summary, {})['strikes_thrown'] = int(match.group(3))
+            elif "Batters faced" in line_text:
+                for chunk in player_chunks:
+                    match = re.search(r"([\w.\s'-]+)\s+(\d+)", chunk)
+                    if match:
+                        player_name_in_summary = match.group(1).strip()
+                        summary_data.setdefault(player_name_in_summary, {})['batters_faced'] = int(match.group(2))
+        return summary_data
 
     def _parse_player_stats(self, page: Page, main_team_db_id, opponent_team_id, main_team_name, source_game_id,year):
         """Explicitly navigates to and parses only the player stats."""
@@ -718,9 +749,11 @@ class YAHOOScraper:
             match_stats_container = page.locator("div.match-stats")
             match_stats_container.wait_for(state="visible", timeout=10000)
 
-            team_headers = match_stats_container.locator("div.D\\(f\\).Mx\\(-10px\\) a").all()
-            if len(team_headers) < 2:
+            team_headers = match_stats_container.locator("div.D\\(f\\).Jc\\(sb\\) > div.Mx\\(10px\\) > a").all()
+            if len(team_headers) != 2:
                 print(f"           - Could not find team headers in player stats tab for game {source_game_id}.")
+                print(f"           - ERROR: Expected to find 2 main team stat columns, but found {len(team_headers)}.")
+
                 return
 
             left_team_name = team_headers[0].text_content().strip()
@@ -731,32 +764,41 @@ class YAHOOScraper:
             else:
                 column_to_team_id[0] = opponent_team_id
                 column_to_team_id[1] = main_team_db_id
+            all_players_data = {}
 
-            players_saved_this_game = set()
-            stat_blocks = match_stats_container.locator("div:has(table.W\\(100\\%\\))").all()
-            for block in stat_blocks:
-                tables_in_block = block.locator("table").all()
-                if len(tables_in_block) != 2: continue
+            for i, team_column in enumerate(team_headers):
+                team_id = column_to_team_id[i]
+                opponent_id = column_to_team_id[1 - i]
 
-                header_info = tables_in_block[0].locator("thead th").all()
-                if not header_info: continue
+                # Find all distinct stat category blocks (e.g., the block for Batting, the block for Pitching)
+                # A block contains a table and may have a sibling DL summary
+                stat_blocks = team_column.locator("> div > div.Ovx\\(s\\)").all()
 
-                category = header_info[0].text_content().strip()
-                header_names = [th.get_attribute('title') or th.text_content().strip() for th in header_info[1:]]
-                header_abbreviations = [th.text_content().strip() for th in header_info[1:]]
+                for block in stat_blocks:
+                    table = block.locator("table").first
+                    if table.count() == 0: continue
 
-                stat_def_id = self.db.get_or_create_stat_definition(self.sport_id, category, header_names, header_abbreviations)
-                if not stat_def_id: continue
+                    # CORRECT SIBLING LOCATOR: Find the <dl> that is a neighbor to the table's container
+                    dl_element = block.locator("xpath=./following-sibling::div/dl").first
+                    summary_data = self._parse_summary_dl(dl_element)
 
-                for i, table in enumerate(tables_in_block):
-                    team_id = column_to_team_id[i]
-                    opponent_id = column_to_team_id[1 - i]
+                    # --- Process the table associated with this block ---
+                    header_info = table.locator("thead th").all()
+                    if not header_info: continue
+
+                    category = header_info[0].text_content().strip()
+                    header_abbreviations = [th.text_content().strip() for th in header_info[1:]]
+                    header_names = [th.get_attribute('title') or abbr for abbr, th in zip(header_abbreviations, header_info[1:])]
+                    stat_def_id = self.db.get_or_create_stat_definition(self.sport_id, category, header_names, header_abbreviations)
+                    if not stat_def_id: continue
+
                     for row in table.locator("tbody tr").all():
                         player_anchor = row.locator("th a").first
-                        if not player_anchor.is_visible(): continue
+                        if not player_anchor.is_visible(timeout=200): continue
 
-                        player_name = player_anchor.text_content().strip()
-                        if "TOTAL" in player_name.upper(): continue
+                        player_name_raw = player_anchor.text_content().strip()
+                        if "TOTAL" in player_name_raw.upper(): continue
+                        player_name = re.sub(r'^[•\s]+', '', player_name_raw).strip()
 
                         player_url = player_anchor.get_attribute('href')
                         player_source_id_match = re.search(r'/(\d+)', player_url or '')
@@ -765,18 +807,48 @@ class YAHOOScraper:
                         player_db_id = self.db.get_or_create_player(self.sport_id, player_name, player_source_id_match.group(1))
                         if not player_db_id: continue
 
-                        players_saved_this_game.add(player_db_id)
-                        stat_values = [td.text_content().strip() for td in row.locator("td").all()]
-                        self.db.insert_player_game_stats(
-                            player_id=player_db_id, team_id=team_id, opponent_team_id=opponent_id,
-                            season=year, source_game_id=source_game_id,
-                            stat_def_id=stat_def_id, stat_values=stat_values
-                        )
+                        # Initialize the player's data structure correctly
+                        all_players_data.setdefault(player_db_id, {})
+                        all_players_data[player_db_id].update({
+                            'team_id': team_id,
+                            'opponent_id': opponent_id,
+                            'stat_def_id': stat_def_id
+                        })
+                        all_players_data[player_db_id].setdefault('stats', {})
 
-            if players_saved_this_game:
-                print(f"           - Success: Parsed player stats for {len(players_saved_this_game)} players in game {source_game_id}.")
-            else:
-                print(f"           - WARNING: Found no players in player stats tab for game {source_game_id}.")
+                        # Add stats from the table
+                        stat_values = [td.text_content().strip() for td in row.locator("td").all()]
+                        for header_key, value in zip(header_abbreviations, stat_values):
+                            all_players_data[player_db_id]['stats'][header_key] = value
+
+                        # Merge summary data if this is a pitcher
+                        if category.upper() == 'PITCHING':
+                            # Find the matching summary key (e.g., "K Gausman") for the full name ("Kevin Gausman")
+                            for summary_name, summary_stats in summary_data.items():
+                                # Check if the name from the summary is a substring of the full name from the table
+                                if summary_name in player_name_raw:
+                                    all_players_data[player_db_id]['stats'].update(summary_stats)
+                                    # Break after finding the first match to prevent incorrect merges
+                                    break
+            # 4. SAVE DATA: Loop through the completed data and save to the database
+            if not all_players_data:
+                print(f"           - WARNING: No player data was successfully parsed for game {source_game_id}.")
+                return
+
+            players_saved_count = 0
+            for player_db_id, data in all_players_data.items():
+                # Use the robust, dictionary-based insertion method
+                success = self.db.insert_player_game_stats_from_dict(
+                    player_id=player_db_id,
+                    data=data,
+                    season=year,
+                    source_game_id=source_game_id
+                )
+                if success:
+                    players_saved_count += 1
+
+            print(f"           - Success: Saved merged stats for {players_saved_count} players in game {source_game_id}.")
 
         except Exception as e:
             print(f"           - CRITICAL Error during player stat parsing for game {source_game_id}: {e}")
+            traceback.print_exc()
