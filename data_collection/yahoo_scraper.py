@@ -356,7 +356,7 @@ class YAHOOScraper:
 
                     # Link finding (adjust as needed from your previous robust version)
                     box_score_link = row.locator('td a[href*="/gamelog/"], td a[href*="/recap?"], td a[href*="/boxscore"], td:first-child a[href], td:nth-child(2) a[href]').first
-                    if not box_score_link.is_visible(timeout=500):
+                    if not box_score_link.is_visible():
                         print(f"        - Warning: No visible box score link in table row: {row_text_content[:100]}")
                         continue
 
@@ -384,7 +384,7 @@ class YAHOOScraper:
                     opponent_display_name = "Unknown Opponent"
                     for opp_sel in opponent_cell_candidate_selectors:
                         opponent_name_element = row.locator(opp_sel).first
-                        if opponent_name_element.is_visible(timeout=200):
+                        if opponent_name_element.is_visible():
                             name_text = opponent_name_element.text_content().strip()
                             name_text = re.sub(r'\s*\d+-\d+(-\d+)?\s*$', '', name_text).strip()
                             name_text = re.sub(r'\s+\d+$', '', name_text).strip()
@@ -420,7 +420,7 @@ class YAHOOScraper:
                     # These might be within a span with id="game-state" or similar
                     game_state_element = item.locator("div#game-state span, span").first # Check for specific status spans
                     game_state_text = ""
-                    if game_state_element.is_visible(timeout=100):
+                    if game_state_element.is_visible():
                         game_state_text = game_state_element.text_content().strip().upper()
 
                     if any(status in game_state_text for status in ["PPD", "POSTPONED", "CANCELED", "CANCELLED", "SUSPENDED", "TBD"]):
@@ -433,7 +433,7 @@ class YAHOOScraper:
                         continue
 
                     link_element = item.locator("a").first
-                    if not link_element.is_visible(timeout=500):
+                    if not link_element.is_visible():
                         print(f"        - Warning: No visible link element in list item: {item_text_content[:100]}")
                         continue
 
@@ -660,23 +660,23 @@ class YAHOOScraper:
                         break # Exit the loop if reload fails
                 else:
                     # This was the final attempt. Print the detailed failure message.
-                    print(f"\n\n\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                    # print(f"\n\n\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                     print(f"!!!!!!   ALL {max_attempts} ATTEMPTS FAILED. SEE DETAILS.   !!!!!!")
-                    print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-                    print(f"URL at time of failure: {page.url}")
-                    print(f"FINAL ERROR TYPE: {type(e).__name__}")
-                    print(f"FINAL ERROR DETAILS: {e}")
-
-                    screenshot_path = "final_debug_odds_failure.png"
-                    html_path = "final_debug_odds_failure.html"
-                    page.screenshot(path=screenshot_path, full_page=True)
-                    with open(html_path, "w", encoding="utf-8") as f:
-                        f.write(page.content())
-
-                    print(f"\n--- DEBUG ARTIFACTS SAVED ---")
-                    print(f"Screenshot of the page saved to: '{screenshot_path}'")
-                    print(f"Full HTML of the page saved to: '{html_path}'")
-                    print(f"--- Please inspect these files to see what the scraper saw. ---\n\n\n")
+                    # print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                    # print(f"URL at time of failure: {page.url}")
+                    # print(f"FINAL ERROR TYPE: {type(e).__name__}")
+                    # print(f"FINAL ERROR DETAILS: {e}")
+                    #
+                    # screenshot_path = "final_debug_odds_failure.png"
+                    # html_path = "final_debug_odds_failure.html"
+                    # page.screenshot(path=screenshot_path, full_page=True)
+                    # with open(html_path, "w", encoding="utf-8") as f:
+                    #     f.write(page.content())
+                    #
+                    # print(f"\n--- DEBUG ARTIFACTS SAVED ---")
+                    # print(f"Screenshot of the page saved to: '{screenshot_path}'")
+                    # print(f"Full HTML of the page saved to: '{html_path}'")
+                    # print(f"--- Please inspect these files to see what the scraper saw. ---\n\n\n")
 
                     return None
 
@@ -739,54 +739,84 @@ class YAHOOScraper:
                         summary_data.setdefault(player_name_in_summary, {})['batters_faced'] = int(match.group(2))
         return summary_data
 
+    # In data_collection/yahoo_scraper.py
+
     def _parse_player_stats(self, page: Page, main_team_db_id, opponent_team_id, main_team_name, source_game_id,year):
-        """Explicitly navigates to and parses only the player stats."""
+        """
+        Parses player stats with a flexible approach.
+        --- V8 (Definitive): Uses positional selection to isolate the correct parent container. ---
+        """
         try:
-            player_stats_button = page.locator('button[data-tst="stats"], button[data-tst="matchstats"]').first
-            player_stats_button.wait_for(state="visible", timeout=10000)
-            player_stats_button.click()
+            # --- FLEXIBLE TAB CLICKING (No changes needed) ---
+            try:
+                player_stats_button = page.locator('button[data-tst="stats"], button[data-tst="matchstats"]').first
+                print(f"           - Checking for a 'Stats' button...")
+                player_stats_button.wait_for(state="visible", timeout=3000)
+                print(f"           - 'Stats' button found. Clicking it to ensure stats are visible.")
+                player_stats_button.click()
+            except PlaywrightError:
+                print(f"           - No 'Stats' button found. Assuming stats are already the default view.")
 
+            # --- MAIN CONTENT PARSING (No changes needed) ---
             match_stats_container = page.locator("div.match-stats")
-            match_stats_container.wait_for(state="visible", timeout=10000)
+            print("           - Waiting for the main stats container to load...")
+            match_stats_container.wait_for(state="visible", timeout=100000)
+            print("           - Main stats container is visible. Proceeding to parse data.")
 
-            team_headers = match_stats_container.locator("div.D\\(f\\).Jc\\(sb\\) > div.Mx\\(10px\\) > a").all()
-            if len(team_headers) != 2:
-                print(f"           - Could not find team headers in player stats tab for game {source_game_id}.")
-                print(f"           - ERROR: Expected to find 2 main team stat columns, but found {len(team_headers)}.")
+            # --- THE DEFINITIVE POSITIONAL LOCATOR ---
+            # 1. Find all potential rows. Based on the HTML, the class combo "D(f) Jc(sb)" is common.
+            all_rows = match_stats_container.locator(".D\\(f\\).Jc\\(sb\\)").all()
 
+            # 2. The row we want is the one that contains the stat columns (divs with class Va(t)).
+            # We will loop through the rows and find the first one that fits this description.
+            stats_row_container = None
+            for row in all_rows:
+                # Check if this row has at least two `div` children with the `Va(t)` class.
+                if row.locator("> div.Va\\(t\\)").count() >= 2:
+                    stats_row_container = row
+                    break # We found the correct row, so we stop looking.
+
+            if not stats_row_container:
+                print(f"           - CRITICAL ERROR: Could not find the main row container for stats in game {source_game_id}.")
                 return
 
-            left_team_name = team_headers[0].text_content().strip()
-            column_to_team_id = {}
-            if main_team_name in left_team_name:
-                column_to_team_id[0] = main_team_db_id
-                column_to_team_id[1] = opponent_team_id
-            else:
-                column_to_team_id[0] = opponent_team_id
-                column_to_team_id[1] = main_team_db_id
+            # 3. Now, get the two columns from *within the correct row container*.
+            team_column_containers = stats_row_container.locator("> div.Va\\(t\\)").all()
+
+            if len(team_column_containers) != 2:
+                print(f"           - ERROR: Expected 2 team column containers, but found {len(team_column_containers)} for game {source_game_id}.")
+                return
+
+            print(f"           - Found exactly 2 team stat columns. Parsing each...")
             all_players_data = {}
 
-            for i, team_column in enumerate(team_headers):
-                team_id = column_to_team_id[i]
-                opponent_id = column_to_team_id[1 - i]
+            # The rest of your proven parsing logic can now proceed safely.
+            for i, team_column in enumerate(team_column_containers):
+                try:
+                    team_name_in_header = team_column.locator("a").first.text_content(timeout=1000).strip()
+                except PlaywrightError:
+                    print(f"           - WARNING: Could not find a team name link in column {i+1}. Skipping column.")
+                    continue
 
-                # Find all distinct stat category blocks (e.g., the block for Batting, the block for Pitching)
-                # A block contains a table and may have a sibling DL summary
-                stat_blocks = team_column.locator("> div > div.Ovx\\(s\\)").all()
+                if main_team_name in team_name_in_header:
+                    team_id = main_team_db_id; opponent_id = opponent_team_id
+                else:
+                    team_id = opponent_team_id; opponent_id = main_team_db_id
 
-                for block in stat_blocks:
-                    table = block.locator("table").first
-                    if table.count() == 0: continue
+                all_stat_tables = team_column.locator("table").all()
+                if not all_stat_tables:
+                    print(f"           - WARNING: No stat tables found within column for '{team_name_in_header}'.")
+                    continue
 
-                    # CORRECT SIBLING LOCATOR: Find the <dl> that is a neighbor to the table's container
-                    dl_element = block.locator("xpath=./following-sibling::div/dl").first
+                for table in all_stat_tables:
+                    dl_element = table.locator("xpath=./parent::div/following-sibling::div/dl").first
                     summary_data = self._parse_summary_dl(dl_element)
-
-                    # --- Process the table associated with this block ---
                     header_info = table.locator("thead th").all()
                     if not header_info: continue
 
                     category = header_info[0].text_content().strip()
+                    if not category: continue
+
                     header_abbreviations = [th.text_content().strip() for th in header_info[1:]]
                     header_names = [th.get_attribute('title') or abbr for abbr, th in zip(header_abbreviations, header_info[1:])]
                     stat_def_id = self.db.get_or_create_stat_definition(self.sport_id, category, header_names, header_abbreviations)
@@ -794,60 +824,42 @@ class YAHOOScraper:
 
                     for row in table.locator("tbody tr").all():
                         player_anchor = row.locator("th a").first
-                        if not player_anchor.is_visible(timeout=200): continue
-
+                        if not player_anchor.is_visible(): continue
                         player_name_raw = player_anchor.text_content().strip()
                         if "TOTAL" in player_name_raw.upper(): continue
                         player_name = re.sub(r'^[•\s]+', '', player_name_raw).strip()
-
                         player_url = player_anchor.get_attribute('href')
                         player_source_id_match = re.search(r'/(\d+)', player_url or '')
                         if not player_source_id_match: continue
-
                         player_db_id = self.db.get_or_create_player(self.sport_id, player_name, player_source_id_match.group(1))
                         if not player_db_id: continue
 
-                        # Initialize the player's data structure correctly
                         all_players_data.setdefault(player_db_id, {})
-                        all_players_data[player_db_id].update({
-                            'team_id': team_id,
-                            'opponent_id': opponent_id,
-                            'stat_def_id': stat_def_id
-                        })
+                        all_players_data[player_db_id].update({'team_id': team_id, 'opponent_id': opponent_id, 'stat_def_id': stat_def_id})
                         all_players_data[player_db_id].setdefault('stats', {})
-
-                        # Add stats from the table
                         stat_values = [td.text_content().strip() for td in row.locator("td").all()]
                         for header_key, value in zip(header_abbreviations, stat_values):
                             all_players_data[player_db_id]['stats'][header_key] = value
 
-                        # Merge summary data if this is a pitcher
                         if category.upper() == 'PITCHING':
-                            # Find the matching summary key (e.g., "K Gausman") for the full name ("Kevin Gausman")
                             for summary_name, summary_stats in summary_data.items():
-                                # Check if the name from the summary is a substring of the full name from the table
                                 if summary_name in player_name_raw:
                                     all_players_data[player_db_id]['stats'].update(summary_stats)
-                                    # Break after finding the first match to prevent incorrect merges
                                     break
-            # 4. SAVE DATA: Loop through the completed data and save to the database
+
             if not all_players_data:
                 print(f"           - WARNING: No player data was successfully parsed for game {source_game_id}.")
                 return
 
             players_saved_count = 0
             for player_db_id, data in all_players_data.items():
-                # Use the robust, dictionary-based insertion method
-                success = self.db.insert_player_game_stats_from_dict(
-                    player_id=player_db_id,
-                    data=data,
-                    season=year,
-                    source_game_id=source_game_id
-                )
-                if success:
-                    players_saved_count += 1
+                success = self.db.insert_player_game_stats_from_dict(player_id=player_db_id, data=data, season=year, source_game_id=source_game_id)
+                if success: players_saved_count += 1
 
-            print(f"           - Success: Saved merged stats for {players_saved_count} players in game {source_game_id}.")
+            if players_saved_count > 0:
+                print(f"           - Success: Saved merged stats for {players_saved_count} players in game {source_game_id}.")
+            else:
+                print(f"           - WARNING: Found player data but failed to save any to the database for game {source_game_id}.")
 
         except Exception as e:
             print(f"           - CRITICAL Error during player stat parsing for game {source_game_id}: {e}")

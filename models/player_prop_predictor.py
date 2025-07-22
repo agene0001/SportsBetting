@@ -112,7 +112,7 @@ class PlayerPropPredictor:
     def _get_mlb_prediction_features(self, player_name, opponent_name, game_context):
         """Generates features for a single MLB prediction."""
         # --- 1. Fetch historical data ---
-        player_history = self.db.fetch_recent_games_for_player(player_name, 'MLB', n=20)
+        player_history = self.db.fetch_recent_pitching_logs_for_player(player_name, n=20)
         if player_history.empty or len(player_history) < 2:
             return None, f"Not enough game history for player '{player_name}'."
 

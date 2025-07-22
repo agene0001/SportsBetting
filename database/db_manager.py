@@ -155,7 +155,95 @@ class DatabaseManager:
                                                                                           last_updated = CURRENT_TIMESTAMP; """
         params = (player_id, team_id, opponent_team_id, season, source_game_id, stat_def_id, stat_values)
         self.execute_query(query, params)
+    # In database/db_manager.py
 
+    # In database/db_manager.py
+
+    def fetch_recent_pitching_logs_for_player(self, player_name, n=15):
+        """
+        Fetches the last N PITCHING-ONLY games for a specific player.
+        This is a specialized version to avoid issues with two-way players.
+        """
+        query = """
+                SELECT p.full_name as player_name, pgs.source_game_id as game_id, pgs.season,
+                       sd.category_name, sd.stat_names, pgs.stat_values
+                FROM player_game_stats pgs
+                         JOIN players p ON pgs.player_id = p.player_id
+                         JOIN sports s ON p.sport_id = s.sport_id
+                         JOIN stat_definitions sd ON pgs.stat_definition_id = sd.stat_definition_id
+                WHERE p.full_name ILIKE %s
+                  AND s.name ILIKE 'MLB'
+                  AND sd.category_name = 'Pitching' -- <<< --- THE CRUCIAL ADDITION
+                ORDER BY pgs.source_game_id DESC
+                LIMIT %s; """
+        raw_data = self.execute_query(query, params=(f'%{player_name}%', n), fetch='all')
+        if not raw_data:
+            return pd.DataFrame()
+
+        processed_data = []
+        for row in raw_data:
+            (name, game_id, season, cat_name, stat_names, stat_values) = row
+            stat_dict = {'player_name': name, 'game_id': game_id, 'season': season}
+            for i, stat_name in enumerate(stat_names):
+                clean_name = f"{cat_name.lower().replace(' ', '_')}_{stat_name.lower().replace(' ', '_')}"
+                stat_dict[clean_name] = pd.to_numeric(stat_values[i], errors='coerce')
+            processed_data.append(stat_dict)
+
+        df = pd.DataFrame(processed_data)
+        df = self._clean_and_rename_game_log_df(df)
+        return df
+
+    def insert_player_game_stats_from_dict(self, player_id, data, season, source_game_id):
+        """
+        Takes a dictionary of player data prepared by the scraper, unpacks it,
+        and saves it to the database. This acts as a helper method.
+
+        Args:
+            player_id (int): The player's unique database ID.
+            data (dict): A dictionary containing team_id, opponent_id, stat_def_id, and a sub-dict of stats.
+            season (int): The season year.
+            source_game_id (str): The game's unique ID.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            # 1. Unpack the main keys from the data dictionary
+            team_id = data['team_id']
+            opponent_team_id = data['opponent_id']
+            stat_def_id = data['stat_def_id']
+            stats_dict = data.get('stats', {}) # Use .get() for safety
+
+            # 2. To insert the data, we need the stat values in the correct order.
+            #    We fetch the canonical order from the stat_definitions table.
+            query = "SELECT stat_abbreviations FROM stat_definitions WHERE stat_definition_id = %s;"
+            result = self.execute_query(query, (stat_def_id,), fetch='one')
+
+            if not result:
+                print(f"  - ERROR: Could not find stat definition for ID {stat_def_id}. Cannot save player stats.")
+                return False
+
+            ordered_abbreviations = result[0]
+
+            # 3. Build the list of stat values in the correct order.
+            #    Use .get(abbr, '0') to handle cases where a player might be missing a stat (e.g., a DH with no fielding stats).
+            stat_values = [stats_dict.get(abbr, '0') for abbr in ordered_abbreviations]
+
+            # 4. Now, call the existing, low-level insertion method with the correctly formatted data.
+            self.insert_player_game_stats(
+                player_id=player_id,
+                team_id=team_id,
+                opponent_team_id=opponent_team_id,
+                season=season,
+                source_game_id=source_game_id,
+                stat_def_id=stat_def_id,
+                stat_values=stat_values
+            )
+            return True
+
+        except (KeyError, TypeError) as e:
+            print(f"  - ERROR: Data dictionary was missing a required key for player {player_id} in game {source_game_id}. Details: {e}")
+            return False
     def fetch_player_game_logs_for_season(self, sport_name, season):
         """
         Fetches all player game logs for a given sport and season, joining
